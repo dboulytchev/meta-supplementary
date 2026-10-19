@@ -10,14 +10,24 @@ struct
   let toPrintable s = M.bindings s
 
   let empty = M.empty
-  let set m name value = M.add name value m
-
+  let set   m name value = M.add name value m
+  let unset m name = M.remove name m
+  
   exception Undefined_variable of string
       
   let get m name =
     match M.find_opt name m with
     | Some x -> x
     | None   -> raise (Undefined_variable name)
+
+  let dynamic m name =
+    None = M.find_opt name m 
+
+  let residualize r z state =
+    List.fold_left
+      (fun acc (x, v) -> r acc x v)
+      z
+      (M.bindings state)
   
   module Printable =
   struct
@@ -74,7 +84,16 @@ struct
   | Const x -> x
   | Binop (op, x, y) ->
     evalBinop (eval state x) (eval state y) op
-    
+
+  let rec spec state = function
+  | Var   x as expr -> if State.dynamic state x then expr else Const (State.get state x)
+  | Const x as expr -> expr
+  | Binop (op, x, y) ->
+     let x', y' = spec state x, spec state y in
+     match x', y' with
+     | Const xv, Const yv -> Const (evalBinop xv yv op)
+     | _, _ -> Binop (op, x', y')
+  
 end
 
 module Stmt =
@@ -99,7 +118,45 @@ struct
      then state
      else eval (eval state b) w                 
   | Do (b, c) as w -> eval state (Seq (b, While (c, b)))      
-                     
+
+  let residualize state stmt =
+    State.residualize (function
+          Skip -> fun x v -> Assn (x, Expr.Const v)
+        | acc  -> fun x v -> Seq  (acc, Assn (x, Expr.Const v))
+      ) stmt state
+  
+  let rec spec state =
+    function
+    | Skip        -> (Skip, state)
+    | Assn (x, e) ->
+       let e' = Expr.spec state e in
+       (match e' with
+        | Expr.Const ve -> (Skip        , State.set  state x ve)
+        | _             -> (Assn (x, e'), State.unset state x)
+       )
+    | Seq (s1, s2) ->
+       (match spec state s1 with
+        | (Skip, state') -> spec state' s2
+        | (s1' , state') ->
+           (match spec state' s2 with
+            | (Skip, state'') -> (s1', state'')
+            | (s2' , state'') -> (Seq (s1', s2'), state'')
+           )
+       )
+    | If (c, t, e) ->
+       (match Expr.spec state c with
+        | Expr.Const cv when cv != 0 -> spec state t
+        | Expr.Const _               -> spec state e
+        | c'                         -> (residualize state (If (c', t, e)), State.empty) 
+       )
+    | While (c, s) as w ->
+       (match Expr.spec state c with
+        | Expr.Const cv when cv != 0 -> spec state (Seq (s, w)) 
+        | Expr.Const cv              -> (Skip, state)
+        | c'                         -> (residualize state (While (c', s)), State.empty)
+       )
+    | Do (s, c) -> spec state (Seq (s, While (c, s)))
+  
 end
 
 module Parser =
@@ -230,7 +287,10 @@ let _ =
      | `Ok stmt ->
         (match Setup.getMode () with
          | `Run  -> Printf.printf "%s\n" @@ show (State.Printable.t) (State.toPrintable @@ Stmt.eval (Setup.getInput ()) stmt)
-         | `Spec -> Printf.eprintf "ERROR: specialization not yet implemented\n"
+         | `Spec ->
+            let (stmt', state') = Stmt.spec (Setup.getInput ()) stmt in
+            let stmt'' = Stmt.residualize state' stmt' in
+            Printf.printf "%s\n" @@ show(Stmt.t) stmt''
         )
      | `Fail errs -> Printf.eprintf "ERROR: %s\n" errs
     )
