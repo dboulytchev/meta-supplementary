@@ -61,6 +61,57 @@ struct
   | Binop of string * t * t
   with show
 
+  @type assoc = No | Left | Right with show
+
+  let prio = function
+  | "!!" -> 1
+  | "&&" -> 2
+  | "==" -> 3
+  | "!=" -> 3
+  | "<=" -> 3
+  | "<"  -> 3
+  | ">=" -> 3
+  | ">"  -> 3
+  | "+"  -> 4
+  | "-"  -> 4
+  | "*"  -> 5
+  | "/"  -> 5
+  | "%"  -> 5
+  | _    -> 0
+  
+  let assoc = function
+  | "!!" -> Left
+  | "&&" -> Left
+  | "==" -> No
+  | "!=" -> No
+  | "<=" -> No
+  | "<"  -> No
+  | ">=" -> No
+  | ">"  -> No
+  | "+"  -> Left
+  | "-"  -> Left
+  | "*"  -> Left
+  | "/"  -> Left
+  | "%"  -> Left
+  | _    -> No
+  
+  let pretty expr =
+    let open Formeat in
+    let rec pretty (context, position) = function 
+    | Var    x         -> string x
+    | Const  n         -> string @@ string_of_int n
+    | Binop (op, l, r) ->
+       let lp = pretty (op, Left ) l in
+       let rp = pretty (op, Right) r in
+       let base = hovbox @@
+                    listBy space [lp; string op; rp]
+       in
+       if prio op < prio context then rbr base
+       else if prio op = prio context && assoc op <> position then rbr base
+       else base       
+    in
+    pretty ("", No) expr
+  
   let evalBinop xv yv =
     let i2b x = if x <> 0 then 1 else 0     in
     let b2i   = function true -> 1 | _ -> 0 in
@@ -108,6 +159,40 @@ struct
   | Do    of t * Expr.t
   with show
 
+  let rec pretty stmt =
+    let open Formeat in
+    match stmt with
+    | Assn (x, e) ->
+       hovbox @@
+         listBy space [string x; string ":="; Expr.pretty e]
+    | Seq (l, r) ->
+       vbox @@
+         listBy
+           (string ";" |> space)
+           [pretty l; pretty r]  
+    | Skip -> string "skip"
+    | If (c, t, e) ->
+       hovbox @@
+         listBy space
+           [string "if";
+            rbr @@ Expr.pretty c;
+            cvbr @@ pretty t;
+            string "else";
+            cvbr @@ pretty e]
+    | While (c, b) ->
+       hovbox @@
+         listBy space
+           [string "while";
+            rbr @@ Expr.pretty c;
+            cvbr @@ pretty b]            
+    | Do (b, c) ->
+       hovbox @@
+         listBy space
+           [string "do";
+            pretty b;
+            string "while";
+            rbr @@ Expr.pretty c]
+  
   let rec eval state = function
   | Assn (x, e)  -> State.set state x (Expr.eval state e)
   | Seq  (l, r)  -> eval (eval state l) r
@@ -290,7 +375,7 @@ let _ =
          | `Spec ->
             let (stmt', state') = Stmt.spec (Setup.getInput ()) stmt in
             let stmt'' = Stmt.residualize state' stmt' in
-            Printf.printf "%s\n" @@ show(Stmt.t) stmt''
+            Printf.printf "%s\n" @@ Formeat.to_string (Stmt.pretty stmt'')
         )
      | `Fail errs -> Printf.eprintf "ERROR: %s\n" errs
     )
