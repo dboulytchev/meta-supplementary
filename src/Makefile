@@ -8,7 +8,7 @@ PXFLAGS = $(CAMLP5)
 BFLAGS = -rectypes -g -package GT,ostap
 OFLAGS = $(BFLAGS) -inline 10
 
-all:.depend $(TOPFILE)
+all:.depend $(TOPFILE) $(TOPFILE).byte
 
 .depend: $(SOURCES)
 	$(OCAMLDEP) $(PXFLAGS) *.ml > .depend
