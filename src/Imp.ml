@@ -12,6 +12,31 @@ struct
   let empty = M.empty
   let set   m name value = M.add name value m
   let unset m name = M.remove name m
+
+  let peep state x =
+    match M.find_opt x state with
+    | Some v -> Printf.printf "%s=%d\n" x v
+    | None   -> Printf.printf "%s undefined\n" x
+  
+  let diff st st' =
+    List.fold_left
+      (fun diffed (x, w) ->
+         match M.find_opt x st' with
+         | None -> M.add x w diffed
+         | _    -> diffed
+      )
+      M.empty
+      (M.bindings st)
+  
+  let join st st' =
+    List.fold_left
+      (fun joined (x, v) ->
+        match M.find_opt x st' with
+        | Some w when v = w -> M.add x w joined
+        | _ -> joined
+      )
+      M.empty
+      (M.bindings st)
   
   exception Undefined_variable of string
       
@@ -56,9 +81,12 @@ module Expr =
 struct
   
   @type t =
-  | Var   of string
-  | Const of int    
-  | Binop of string * t * t
+  | Var    of string
+  | Const  of int    
+  | Binop  of string * t * t
+  | Elem   of t * t
+  | Length of t
+  | Subst  of t * t * t
   with show
 
   @type assoc = No | Left | Right with show
@@ -204,11 +232,19 @@ struct
      else eval (eval state b) w                 
   | Do (b, c) as w -> eval state (Seq (b, While (c, b)))      
 
-  let residualize state stmt =
-    State.residualize (function
+  let residualizeAfter state stmt =
+    State.residualize
+      (function
           Skip -> fun x v -> Assn (x, Expr.Const v)
         | acc  -> fun x v -> Seq  (acc, Assn (x, Expr.Const v))
-      ) stmt state
+      )
+      stmt
+      state
+
+  let residualizeBefore state stmt =
+    match residualizeAfter state Skip with
+    | Skip -> stmt
+    | s    -> Seq (s, stmt)
   
   let rec spec state =
     function
@@ -216,7 +252,7 @@ struct
     | Assn (x, e) ->
        let e' = Expr.spec state e in
        (match e' with
-        | Expr.Const ve -> (Skip        , State.set  state x ve)
+        | Expr.Const ve -> (Skip        , State.set   state x ve)
         | _             -> (Assn (x, e'), State.unset state x)
        )
     | Seq (s1, s2) ->
@@ -232,13 +268,27 @@ struct
        (match Expr.spec state c with
         | Expr.Const cv when cv != 0 -> spec state t
         | Expr.Const _               -> spec state e
-        | c'                         -> (residualize state (If (c', t, e)), State.empty) 
+        | c' ->
+           let t', state'  = spec state t in
+           let e', state'' = spec state e in
+           let joined      = State.join state' state'' in
+           If (c', residualizeAfter (State.diff state'  joined) t',
+                   residualizeAfter (State.diff state'' joined) e'),
+           joined
        )
     | While (c, s) as w ->
        (match Expr.spec state c with
         | Expr.Const cv when cv != 0 -> spec state (Seq (s, w)) 
         | Expr.Const cv              -> (Skip, state)
-        | c'                         -> (residualize state (While (c', s)), State.empty)
+        | _ ->
+           let _ , state'   = spec state s                     in
+           let _ , state''  = spec (State.join state state') s in
+           let state''      = State.join state state''         in
+           let s', state''' = spec state'' s                   in
+           residualizeBefore
+             (State.diff state state'')
+             (While (Expr.spec state'' c, residualizeAfter (State.diff state''' state'') s')),
+           state''
        )
     | Do (s, c) -> spec state (Seq (s, While (c, s)))
   
@@ -374,7 +424,7 @@ let _ =
          | `Run  -> Printf.printf "%s\n" @@ show (State.Printable.t) (State.toPrintable @@ Stmt.eval (Setup.getInput ()) stmt)
          | `Spec ->
             let (stmt', state') = Stmt.spec (Setup.getInput ()) stmt in
-            let stmt'' = Stmt.residualize state' stmt' in
+            let stmt'' = Stmt.residualizeAfter state' stmt' in
             Printf.printf "%s\n" @@ Formeat.to_string (Stmt.pretty stmt'')
         )
      | `Fail errs -> Printf.eprintf "ERROR: %s\n" errs
