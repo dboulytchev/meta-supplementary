@@ -69,6 +69,13 @@ module Value =
              ) ivs;
            Array orig'
         )
+
+    ostap (
+      parse:
+        n:DECIMAL                      {Int n}
+      | "[" vs:!(Util.list)[parse] "]" {Array (Array.of_list vs)}
+      | "?"                            {Dyn} 
+    )
     
   end
 
@@ -122,7 +129,7 @@ module State =
       | None           -> true
       | Some Value.Dyn -> true
       | Some _         -> false
-    
+
     let residualize r z state =
       List.fold_left
         (fun acc (x, v) -> r acc x v)
@@ -135,12 +142,6 @@ module State =
       end
 
     let parse s =
-      let ostap (
-        value:
-          n:DECIMAL                      {Value.Int n}
-        | "[" vs:!(Util.list)[value] "]" {Value.Array (Array.of_list vs)}
-      )
-      in      
       Util.parse
         (object (self: 'self)
            inherit Matcher.t s
@@ -151,7 +152,7 @@ module State =
                    ] s
          end) 
         (ostap (
-             bs:!(Util.list)[ostap (LIDENT -"=" value)] EOF {
+             bs:!(Util.list)[ostap (LIDENT -"=" !(Value.parse))] EOF {
                  List.fold_left (fun st (x, v) -> set st x v) empty bs 
              }      
         ))
@@ -207,6 +208,7 @@ module Expr =
   
     let pretty expr =
       let open Formeat in
+      let top = ("", No) in
       let rec pretty (context, position) = function 
       | Var    x         -> string x
       | Const  n         -> string @@ string_of_int n
@@ -218,9 +220,16 @@ module Expr =
          in
          if prio op < prio context then rbr base
          else if prio op = prio context && assoc op <> position then rbr base
-         else base       
+         else base
+      | Array (es)      -> hovbox (rbr @@ list (List.map (pretty top) @@ Array.to_list es))
+      | Elem  (a, i)    -> hovbox @@ listBy space [pretty top a; sqbr @@ pretty ("", No) i] 
+      | Length e        -> hovbox @@ seq [pretty top e; string ".length"] 
+      | Subst  (t, ivs) -> hovbox (sqbr @@ seq [pretty top t;
+                                                string "with";
+                                                list @@ List.map (fun (i, v) -> listBy space [pretty top i; string "="; pretty top v]) ivs
+                                               ]) 
       in
-      pretty ("", No) expr
+      pretty top expr
     
     let evalBinop xv yv =
       let open Value in
@@ -251,17 +260,64 @@ module Expr =
     | Elem  (a, i)    -> Value.elem  (eval state a) (eval state i)
     | Subst (a, ivs)  -> Value.subst (eval state a) (List.map (fun (i, v) -> eval state i, eval state v) ivs)
     | Array es        -> Value.Array (Array.map (eval state) es)
-       
-    (*
+
+    let rec residualizeValue base = function
+      | Value.Dyn      -> base
+      | Value.Array vs -> Array (Array.mapi (fun i v -> residualizeValue (Elem (base, Const i)) v) vs)
+      | Value.Int   n  -> Const n
+
     let rec spec state = function
-    | Var   x as expr -> invalid_arg "not yet supported" (* if State.dynamic state x then expr else Const (State.get state x) (* Meeoow! *) *)
+    | Var x as expr ->
+       (try
+          residualizeValue expr @@ State.get state x
+        with
+          State.Undefined_variable _ -> Var x
+       )
     | Const x as expr -> expr
     | Binop (op, x, y) ->
        let x', y' = spec state x, spec state y in
-       match x', y' with
-       | Const xv, Const yv -> Const (evalBinop xv yv op)
-       | _, _ -> Binop (op, x', y')
-     *)
+       (match x', y' with
+        | Const xv, Const yv ->
+           Const (Value.(!?) @@ evalBinop (Value.int xv) (Value.int yv) op)
+        | _, _ -> Binop (op, x', y')
+       )
+    | Array es -> Array (Array.map (spec state) es)
+    | Length e ->
+       (match spec state e with
+        | Array es -> Const (Array.length es)
+        | e'       -> Length e'        
+       )
+    | Elem (a, i) ->
+       (match spec state a, spec state i with
+        | Array es, Const i -> es.(i)
+        | a', i'            -> Elem (a', i')
+       )
+    | Subst (a, ivs) ->
+       (match spec state a, List.map (fun (i, v) -> spec state i, spec state v) ivs with
+        | Array a', ivs' ->
+           let prefix, suffix, _ =
+             List.fold_left
+               (fun (prefix, suffix, toSuffix) (i, v) ->
+                 if toSuffix
+                 then prefix, (i, v)::suffix, toSuffix
+                 else
+                   match i with
+                   | Const i -> (i, v) :: prefix, suffix, toSuffix
+                   | _       -> prefix, (i, v)::suffix  , true
+               )
+               ([], [], false)
+               ivs'
+           in
+           let prefix, suffix = List.rev prefix, List.rev suffix in
+           let copy = Array.copy a' in
+           List.iter (fun (j, v) -> copy.(j) <- v) prefix;
+           (match suffix with
+            | [] -> Array copy
+            | _  -> Subst (Array copy, suffix)
+           )
+        | a', ivs' -> Subst (a', ivs')
+       )
+    
   end
 
 module Stmt =
@@ -322,12 +378,12 @@ module Stmt =
          then state
          else eval (eval state b) w                 
       | Do (b, c) as w -> eval state (Seq (b, While (c, b)))      
-    (*
+    
     let residualizeAfter state stmt =
       State.residualize
         (function
-           Skip -> fun x v -> Assn (x, Expr.Const v)
-         | acc  -> fun x v -> Seq  (acc, Assn (x, Expr.Const v))
+           Skip -> fun x v -> Assn (x, Expr.residualizeValue (Expr.Var x) v)
+         | acc  -> fun x v -> Seq  (acc, Assn (x, Expr.residualizeValue (Expr.Var x) v))
         )
         stmt
         state
@@ -343,9 +399,9 @@ module Stmt =
       | Assn (x, e) ->
          let e' = Expr.spec state e in
          (match e' with
-          | Expr.Const ve -> (Skip        , State.set   state x ve)
+          | Expr.Const ve -> (Skip        , State.set   state x (Value.int ve))
           | _             -> (Assn (x, e'), State.unset state x)
-         )
+         )    
       | Seq (s1, s2) ->
          (match spec state s1 with
           | (Skip, state') -> spec state' s2
@@ -354,7 +410,7 @@ module Stmt =
               | (Skip, state'') -> (s1', state'')
               | (s2' , state'') -> (Seq (s1', s2'), state'')
              )
-         )
+         ) 
       | If (c, t, e) ->
          (match Expr.spec state c with
           | Expr.Const cv when cv != 0 -> spec state t
@@ -366,7 +422,7 @@ module Stmt =
              If (c', residualizeAfter (State.diff state'  joined) t',
                  residualizeAfter (State.diff state'' joined) e'),
              joined
-         )
+         ) 
       | While (c, s) as w ->
          (match Expr.spec state c with
           | Expr.Const cv when cv != 0 -> spec state (Seq (s, w)) 
@@ -380,9 +436,9 @@ module Stmt =
                (State.diff state state'')
                (While (Expr.spec state'' c, residualizeAfter (State.diff state''' state'') s')),
              state''
-         )
+         ) 
       | Do (s, c) -> spec state (Seq (s, While (c, s)))
-     *)    
+     
   end
 
 module Parser =
@@ -523,12 +579,10 @@ let _ =
      | `Ok stmt ->
         (match Setup.getMode () with
          | `Run  -> Printf.printf "%s\n" @@ show (State.Printable.t) (State.toPrintable @@ Stmt.eval (Setup.getInput ()) stmt)
-         | `Spec -> invalid_arg "not yet implemented"
-         (*
+         | `Spec -> 
             let (stmt', state') = Stmt.spec (Setup.getInput ()) stmt in
             let stmt'' = Stmt.residualizeAfter state' stmt' in
             Printf.printf "%s\n" @@ Formeat.to_string (Stmt.pretty stmt'')
-          *)
         )
      | `Fail errs -> Printf.eprintf "ERROR: %s\n" errs
     )
