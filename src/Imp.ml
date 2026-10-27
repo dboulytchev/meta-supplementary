@@ -262,7 +262,7 @@ module Expr =
     | Elem  (a, i)    -> Value.elem  (eval state a) (eval state i)
     | Subst (a, ivs)  -> Value.subst (eval state a) (List.map (fun (i, v) -> eval state i, eval state v) ivs)
     | Array es        -> Value.Array (Array.map (eval state) es)
-
+   
     let rec residualizeValue base = function
       | Value.Dyn      -> base
       | Value.Array vs -> Array (Array.mapi (fun i v -> residualizeValue (Elem (base, Const i)) v) vs)
@@ -401,9 +401,34 @@ module Stmt =
       | Assn (x, e) ->
          let e' = Expr.spec state e in
          (match e' with
-          | Expr.Const ve -> (Skip        , State.set   state x (Value.int ve))
-          | _             -> (Assn (x, e'), State.unset state x)
-         )    
+          | Expr.Const ve -> (Skip, State.set state x (Value.int ve))
+          | Expr.Array es ->
+             let rec toValue base es =
+               let _, subst, values =
+                 Array.fold_left
+                   (fun (i, subst, values) ->
+                      function
+                      | Expr.Const n  -> (i+1, subst, (Value.Int n)::values)
+                      | Expr.Array es ->
+                         let base', values' =
+                           toValue (Expr.Elem (base, Expr.Const i)) es
+                         in
+                         (i+1, (Expr.Const i, base')::subst, (Value.Array (Array.of_list values')) :: values)
+                      | b -> (i+1, (Expr.Const i,
+                                    b
+                                   )::subst,
+                              Value.Dyn::values
+                             )
+                   ) (0, [], []) es
+               in
+               match subst with
+               | [] -> base, List.rev values
+               | _  -> Expr.Subst (base, List.rev subst), List.rev values
+             in
+             let x', es' = toValue (Var x) es in
+             (Assn (x, x'), State.set state x (Value.Array (Array.of_list es')))         
+          | _ -> (Assn (x, e'), State.unset state x)
+         )  
       | Seq (s1, s2) ->
          (match spec state s1 with
           | (Skip, state') -> spec state' s2
@@ -414,6 +439,9 @@ module Stmt =
              )
          ) 
       | If (c, t, e) ->
+         let c' = Expr.spec state c in
+         Printf.printf "if: %s\n" (show(Expr.t) c');
+         
          (match Expr.spec state c with
           | Expr.Const cv when cv != 0 -> spec state t
           | Expr.Const _               -> spec state e
@@ -426,6 +454,8 @@ module Stmt =
              joined
          ) 
       | While (c, s) as w ->
+         let c' = Expr.spec state c in
+         Printf.printf "while: %s\n" (show(Expr.t) c');
          (match Expr.spec state c with
           | Expr.Const cv when cv != 0 -> spec state (Seq (s, w)) 
           | Expr.Const cv              -> (Skip, state)
