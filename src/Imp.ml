@@ -221,11 +221,13 @@ module Expr =
          if prio op < prio context then rbr base
          else if prio op = prio context && assoc op <> position then rbr base
          else base
-      | Array (es)      -> hovbox (rbr @@ list (List.map (pretty top) @@ Array.to_list es))
+      | Array (es)      -> hovbox (sqbr @@ list (List.map (pretty top) @@ Array.to_list es))
       | Elem  (a, i)    -> hovbox @@ listBy space [pretty top a; sqbr @@ pretty ("", No) i] 
       | Length e        -> hovbox @@ seq [pretty top e; string ".length"] 
       | Subst  (t, ivs) -> hovbox (sqbr @@ seq [pretty top t;
+                                                space;
                                                 string "with";
+                                                space;
                                                 list @@ List.map (fun (i, v) -> listBy space [pretty top i; string "="; pretty top v]) ivs
                                                ]) 
       in
@@ -337,7 +339,7 @@ module Stmt =
       match stmt with
       | Assn (x, e) ->
          hovbox @@
-           listBy space [string x; string ":="; Expr.pretty e]
+           listBy space [string x; string "="; Expr.pretty e]
       | Seq (l, r) ->
          vbox @@
            listBy
@@ -582,7 +584,7 @@ let _ =
          | `Spec -> 
             let (stmt', state') = Stmt.spec (Setup.getInput ()) stmt in
             let stmt'' = Stmt.residualizeAfter state' stmt' in
-            Printf.printf "%s\n" @@ Formeat.to_string (Stmt.pretty stmt'')
+            Printf.printf "%s\n" @@ Formeat.to_string (Formeat.vbox (Formeat.cvbr (Stmt.pretty stmt'')))
         )
      | `Fail errs -> Printf.eprintf "ERROR: %s\n" errs
     )
