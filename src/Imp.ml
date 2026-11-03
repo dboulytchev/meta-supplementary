@@ -341,32 +341,31 @@ module Stmt =
          hovbox @@
            listBy space [string x; string "="; Expr.pretty e]
       | Seq (l, r) ->
-         vbox @@
-           listBy
-             (string ";" |> space)
-             [pretty l; pretty r]  
+         let rec fringe acc = function
+         | Seq (l, r) -> fringe (fringe acc r) l
+         | stmt       -> stmt::acc
+         in         
+         vbox (
+           string "{" |> space |>
+           listBy (string ";" |> space) @@ List.map pretty (fringe [] stmt)    
+         ) |> nl |> string "}"    
       | Skip -> string "skip"
       | If (c, t, e) ->
-         hovbox @@
-           listBy space
-             [string "if";
-              rbr @@ Expr.pretty c;
-              cvbr @@ pretty t;
-              string "else";
-              cvbr @@ pretty e]
+         hovbox (
+           string "if " |> (rbr @@ Expr.pretty c) |> space |>
+           cvbr (pretty t) |> space |>
+           string "else " |> cvbr (pretty e)  
+         )
       | While (c, b) ->
-         hovbox @@
-           listBy space
-             [string "while";
-              rbr @@ Expr.pretty c;
-              cvbr @@ pretty b]            
+         hovbox (
+           string "while " |> (rbr @@ Expr.pretty c) |> space |>
+           pretty b    
+         )
       | Do (b, c) ->
-         hovbox @@
-           listBy space
-             [string "do";
-              pretty b;
-              string "while";
-              rbr @@ Expr.pretty c]
+         hovbox (
+           string "do " |> space |> pretty b |> space |>
+           string "while " |> rbr (Expr.pretty c)
+         )
     
     let rec eval state =
       let open Value in
@@ -439,9 +438,6 @@ module Stmt =
              )
          ) 
       | If (c, t, e) ->
-         let c' = Expr.spec state c in
-         Printf.printf "if: %s\n" (show(Expr.t) c');
-         
          (match Expr.spec state c with
           | Expr.Const cv when cv != 0 -> spec state t
           | Expr.Const _               -> spec state e
@@ -454,8 +450,6 @@ module Stmt =
              joined
          ) 
       | While (c, s) as w ->
-         let c' = Expr.spec state c in
-         Printf.printf "while: %s\n" (show(Expr.t) c');
          (match Expr.spec state c with
           | Expr.Const cv when cv != 0 -> spec state (Seq (s, w)) 
           | Expr.Const cv              -> (Skip, state)
@@ -527,7 +521,7 @@ module Parser =
             Stmt.Seq (i, Stmt.While (c, Stmt.Seq (b, s)))
           }
         | %"if" s:ifPart {s}      
-        | -"{" seq -"}";
+        | -"{" seq -"}" -";"?;
         ifPart: "(" c:expression ")" t:stmt e:elsePart? {
           Stmt.If (c, t, match e with None -> Stmt.Skip | Some s -> s)
         };
@@ -614,7 +608,14 @@ let _ =
          | `Spec -> 
             let (stmt', state') = Stmt.spec (Setup.getInput ()) stmt in
             let stmt'' = Stmt.residualizeAfter state' stmt' in
-            Printf.printf "%s\n" @@ Formeat.to_string (Formeat.vbox (Formeat.cvbr (Stmt.pretty stmt'')))
+            Printf.printf "%s\n" @@ Formeat.to_string (match stmt'' with
+                                                       | Stmt.Seq _ -> Stmt.pretty stmt''
+                                                       | _          -> let open Formeat in
+                                                                       vbox (
+                                                                         string "{" |> space |>
+                                                                         Stmt.pretty stmt''
+                                                                       ) |> nl |> string "}"
+                                                      )
         )
      | `Fail errs -> Printf.eprintf "ERROR: %s\n" errs
     )
