@@ -29,7 +29,12 @@ module Value =
       struct
         @type t = string with show
       end
-    
+
+    let rec dyn = function
+    | Dyn      -> true
+    | Int   _  -> false
+    | Array vs -> Array.exists dyn vs
+       
     let rec join v1 v2 =
       match v1, v2 with
       | Int x , Int y when x = y ->
@@ -101,8 +106,9 @@ module State =
       List.fold_left
         (fun diffed (x, w) ->
           match M.find_opt x st' with
-          | None -> M.add x w diffed
-          | _    -> diffed
+          | None                    -> M.add x w diffed
+          | Some v when Value.dyn v -> M.add x w diffed
+          | _                       -> diffed
         )
         M.empty
         (M.bindings st)
@@ -407,17 +413,13 @@ module Stmt =
                  Array.fold_left
                    (fun (i, subst, values) ->
                       function
-                      | Expr.Const n  -> (i+1, subst, (Value.Int n)::values)
+                      | Expr.Const n  -> (i+1, (Expr.Const i, Expr.Const n)::subst, (Value.Int n)::values)
                       | Expr.Array es ->
                          let base', values' =
                            toValue (Expr.Elem (base, Expr.Const i)) es
                          in
                          (i+1, (Expr.Const i, base')::subst, (Value.Array (Array.of_list values')) :: values)
-                      | b -> (i+1, (Expr.Const i,
-                                    b
-                                   )::subst,
-                              Value.Dyn::values
-                             )
+                      | b -> (i+1, (Expr.Const i, b)::subst, Value.Dyn::values)
                    ) (0, [], []) es
                in
                match subst with
@@ -425,7 +427,10 @@ module Stmt =
                | _  -> Expr.Subst (base, List.rev subst), List.rev values
              in
              let x', es' = toValue (Var x) es in
-             (Assn (x, x'), State.set state x (Value.Array (Array.of_list es')))         
+             let v       = Value.Array (Array.of_list es') in
+             if Value.dyn v
+             then (Assn (x, x'), State.set state x v)
+             else (Skip        , State.set state x v)
           | _ -> (Assn (x, e'), State.unset state x)
          )  
       | Seq (s1, s2) ->
@@ -446,7 +451,7 @@ module Stmt =
              let e', state'' = spec state e in
              let joined      = State.join state' state'' in
              If (c', residualizeAfter (State.diff state'  joined) t',
-                 residualizeAfter (State.diff state'' joined) e'),
+                     residualizeAfter (State.diff state'' joined) e'),
              joined
          ) 
       | While (c, s) as w ->
