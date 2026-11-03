@@ -1,0 +1,14 @@
+{
+   n = a.length;
+   
+   while (n) {
+     i = 0;
+     while (i < a.length - 1) {
+       if (a[i] > a[i+1]) {
+         a = [a with i=a[i+1], i+1=a[i]];
+       }
+       i += 1;
+     }
+     n -= 1;
+   }
+}
