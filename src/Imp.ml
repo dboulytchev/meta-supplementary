@@ -7,19 +7,33 @@ module Value =
     @type t =
     | Int   of int
     | Array of t array
+    | Sexp  of string * t array
     | Dyn
     with show
 
     let toPrintable v =
-      let buf   = Buffer.create 256 in
-      let put s = Buffer.add_string buf s in
-      let rec inner = function
+      let buf    = Buffer.create 256 in
+      let put  s = Buffer.add_string buf s in
+      let rec putA a =
+        ignore @@
+           Array.fold_left
+             (fun first v ->
+               if first then inner v else (put ", "; inner v);
+               false
+             )
+             true
+             a
+      and inner = function
       | Int   n -> put @@ string_of_int n
-      | Array a ->
-         put "[";
-         ignore @@ Array.fold_left (fun first v -> if first then inner v else (put ", "; inner v); false) true a;
-         put "]"
-
+      | Array a -> put "["; putA a; put "]"
+      | Sexp (tag, args) ->
+         if Array.length args = 0
+         then put tag
+         else (
+           put (tag ^ " (");
+           putA (args);
+           put (")")
+         )
       | Dyn -> put "?"
       in
       inner v;
@@ -33,7 +47,8 @@ module Value =
     let rec dyn = function
     | Dyn      -> true
     | Int   _  -> false
-    | Array vs -> Array.exists dyn vs
+    | Sexp (_, vs) | Array vs -> Array.exists dyn vs
+    
        
     let rec join v1 v2 =
       match v1, v2 with
@@ -41,19 +56,23 @@ module Value =
          Int x
       | Array xs, Array ys when Array.length xs = Array.length ys ->
          Array (Array.init (Array.length xs) (fun i -> join xs.(i) ys.(i)))
+      | Sexp (t1, xs), Sexp (t2, ys) when t1 = t2 && Array.length xs = Array.length ys ->
+         Sexp (t1, Array.init (Array.length xs) (fun i -> join xs.(i) ys.(i)))
       | _ -> Dyn
 
     let (!?) = function
     | Int n -> n
     | v     -> invalid_arg (Printf.sprintf "integer value expected in evalBinop but %s is provided" (show(Printable.t) @@ toPrintable v))
         
-    let int   n = Int n 
-    let array a = Array a
+    let int   n   = Int n 
+    let array a   = Array a
+    let sexp  t a = Sexp (t, a)
     
     let checkArray a cont =
       match a with
-      | Array v -> cont v
+      | Array v | Sexp (_, v) -> cont v
       | _       -> invalid_arg (Printf.sprintf "array value expected in length but %s is provided" (show(Printable.t) @@ toPrintable a))
+    
 
     let checkIndex a i cont =
       let len = Array.length a in
@@ -72,14 +91,16 @@ module Value =
                 let i = !? i in               
                 checkIndex orig' i (fun _ -> orig'.(i) <- v);
              ) ivs;
-           Array orig'
+           (match a with Sexp (t, _) -> Sexp (t, orig') | _ -> Array orig')
         )
 
     ostap (
       parse:
-        n:DECIMAL                      {Int n}
-      | "[" vs:!(Util.list)[parse] "]" {Array (Array.of_list vs)}
-      | "?"                            {Dyn} 
+        n:DECIMAL                                {Int n}
+      | "[" vs:!(Util.list0)[parse]          "]" {Array (Array.of_list vs)}
+      | t:UIDENT args:(-"(" !(Util.list)[parse] -")")?
+                     {Sexp (t, match args with None -> [||] | Some vs -> Array.of_list vs)}
+      | "?"                                      {Dyn} 
     )
     
   end
@@ -152,7 +173,8 @@ module State =
         (object (self: 'self)
            inherit Matcher.t s
            inherit Util.Lexers.decimal s
-           inherit Util.Lexers.lident [] s 
+           inherit Util.Lexers.uident [] s
+           inherit Util.Lexers.lident [] s
            inherit Util.Lexers.skip [
                        Matcher.Skip.whitespaces " \t\n\r";
                    ] s
@@ -176,6 +198,7 @@ module Expr =
       | Elem   of t * t
       | Length of t
       | Subst  of t * (t * t) list
+      | Sexp   of string * t array
     with show
     
     @type assoc = No | Left | Right with show
@@ -228,6 +251,15 @@ module Expr =
          else if prio op = prio context && assoc op <> position then rbr base
          else base
       | Array (es)      -> hovbox (sqbr @@ list (List.map (pretty top) @@ Array.to_list es))
+      | Sexp (t, es) ->
+         if Array.length es > 0
+         then hovbox
+                (seq [
+                     string (t ^ " ");  
+                     rbr @@ list (List.map (pretty top) @@ Array.to_list es)
+                ])
+         else string t
+    
       | Elem  (a, i)    -> hovbox @@ listBy space [pretty top a; sqbr @@ pretty ("", No) i] 
       | Length e        -> hovbox @@ seq [pretty top e; string ".length"] 
       | Subst  (t, ivs) -> hovbox (sqbr @@ seq [pretty top t;
@@ -268,7 +300,8 @@ module Expr =
     | Elem  (a, i)    -> Value.elem  (eval state a) (eval state i)
     | Subst (a, ivs)  -> Value.subst (eval state a) (List.map (fun (i, v) -> eval state i, eval state v) ivs)
     | Array es        -> Value.Array (Array.map (eval state) es)
-
+    | Sexp (t, es)    -> Value.Sexp (t, Array.map (eval state) es)
+    
     let rec eval' expr =
       match expr with
       | Var   x -> fun state -> State.get state x
@@ -301,27 +334,35 @@ module Expr =
     let rec residualizeValue base = function
       | Value.Dyn      -> base
       | Value.Array vs -> Array (Array.mapi (fun i v -> residualizeValue (Elem (base, Const i)) v) vs)
+      | Value.Sexp (t, vs) -> Sexp (t,  Array.mapi (fun i v -> residualizeValue (Elem (base, Const i)) v) vs)
       | Value.Int   n  -> Const n
 
     let rec spec state = function
-    | Var x as expr ->
+    | Var x as expr -> 
        (try
-          residualizeValue expr @@ State.get state x
+          let value = State.get state x in
+          (value, residualizeValue expr value) 
         with
-          State.Undefined_variable _ -> Var x
+          State.Undefined_variable _ -> (Value.Dyn, Var x)
        )
-    | Const x as expr -> expr
+    | Const x as expr -> (Value.Int x, expr)
     | Binop (op, x, y) ->
-       let x', y' = spec state x, spec state y in
-       (match x', y' with
-        | Const xv, Const yv ->
-           Const (Value.(!?) @@ evalBinop (Value.int xv) (Value.int yv) op)
-        | _, _ -> Binop (op, x', y')
+       let (xv', x'), (yv', y') = spec state x, spec state y in
+       (match xv', yv' with
+        | Value.Int xv, Value.Int yv ->
+           let v = evalBinop xv' yv' op) in
+           (v, Const !? v) 
+        | _, _ -> (Value.Dyn, Binop (op, x', y'))
        )
-    | Array es -> Array (Array.map (spec state) es)
+
+    | Array es ->
+       let esv, ese = Array.split @@ Array.map (spec state) es in     
+       Value.Array esv, Array ese
+    
+    | Sexp (t, es) -> Sexp (t, Array.map (spec state) es)
     | Length e ->
        (match spec state e with
-        | Array es -> Const (Array.length es)
+        | Array es | Sexp (_, es) -> Const (Array.length es)       
         | e'       -> Length e'        
        )
     | Elem (a, i) ->
@@ -462,7 +503,9 @@ module Stmt =
       function
       | Skip        -> (Skip, state)
       | Assn (x, e) ->
-         let e' = Expr.spec state e in
+         let v, e' = Expr.spec state e in
+         Assn (x, e'), State.set state x v
+    
          (match e' with
           | Expr.Const ve -> (Skip, State.set state x (Value.int ve))
           | Expr.Array es ->
@@ -552,7 +595,7 @@ module GE_exp =
       List.fold_right (fun e acc -> Seq (e, acc)) (inner [Assn ("d", Const 1)] k) Skip
 
 
-    let _ = Printf.printf "%s" (Formeat.to_string (Stmt.pretty (make 5)))
+                      (*let _ = Printf.printf "%s" (Formeat.to_string (Stmt.pretty (make 5))) *)
   end
 
   
@@ -591,7 +634,10 @@ module Parser =
       and primary s = ostap (
                           x:LIDENT                                                                          {Expr.Var   x}
                       |   c:DECIMAL                                                                         {Expr.Const c}
-                      | "[" a:!(Util.list)[expression] "]"                                                  {Expr.Array (Array.of_list a)}
+                        | "[" a:!(Util.list)[expression] "]"                                                  {Expr.Array (Array.of_list a)}
+                        | t:UIDENT args:(-"(" !(Util.list)[expression] -")")? {
+                                            Expr.Sexp (t, match args with Some args -> Array.of_list args | None -> [||])
+                                          }
                       | "[" base:expression "with" ivs:!(Util.list)[ostap (expression -"=" expression)] "]" {Expr.Subst (base, ivs)}
                       | -"(" expression -")" 
                       ) s
@@ -630,7 +676,8 @@ module Parser =
         (object (self: 'self)
            inherit Matcher.t s
            inherit Util.Lexers.decimal s
-           inherit Util.Lexers.lident ["if"; "else"; "elif"; "while"; "do"; "for"; "skip"; "with"; "length"] s 
+           inherit Util.Lexers.lident ["if"; "else"; "elif"; "while"; "do"; "for"; "skip"; "with"; "length"] s
+           inherit Util.Lexers.uident [] s
            inherit Util.Lexers.skip [
                        Matcher.Skip.whitespaces " \t\n\r";
                        Matcher.Skip.lineComment "--";
@@ -693,7 +740,7 @@ let _ =
     (match Parser.parse @@ Util.read (Setup.getFile ()) with
      | `Ok stmt ->
         (match Setup.getMode () with
-         | `Run  -> Printf.printf "%s\n" @@ show (State.Printable.t) (State.toPrintable @@ Stmt.eval' stmt (Setup.getInput ()))
+         | `Run  -> Printf.printf "%s\n" @@ show (State.Printable.t) (State.toPrintable @@ Stmt.eval (Setup.getInput ()) stmt)
          | `Spec -> 
             let (stmt', state') = Stmt.spec (Setup.getInput ()) stmt in
             let stmt'' = Stmt.residualizeAfter state' stmt' in
