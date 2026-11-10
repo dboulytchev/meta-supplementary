@@ -268,7 +268,36 @@ module Expr =
     | Elem  (a, i)    -> Value.elem  (eval state a) (eval state i)
     | Subst (a, ivs)  -> Value.subst (eval state a) (List.map (fun (i, v) -> eval state i, eval state v) ivs)
     | Array es        -> Value.Array (Array.map (eval state) es)
-   
+
+    let rec eval' expr =
+      match expr with
+      | Var   x -> fun state -> State.get state x
+      | Const x -> fun state -> Value.Int x
+    
+      | Binop (op, x, y) ->
+         let xs = eval' x in
+         let ys = eval' y in
+         fun state -> evalBinop (xs state) (ys state) op
+    
+      | Length a -> 
+         let sa = eval' a in
+         fun state -> Value.length @@ sa state
+    
+      | Elem (a, i) ->
+         let sa = eval' a in
+         let si = eval' i in
+         fun state -> Value.elem  (sa state) (si state)
+    
+      | Subst (a, ivs) ->
+         let sa   = eval' a in
+         let sivs = List.map (fun (i, v) -> eval' i, eval' v) ivs in
+         fun state ->
+         Value.subst (sa state) (List.map (fun (si, sv) -> si state, sv state) sivs)
+    
+      | Array es ->
+         let ses = Array.map (fun e -> eval' e) es in
+         fun state -> Value.Array (Array.map (fun se -> se state) ses)
+
     let rec residualizeValue base = function
       | Value.Dyn      -> base
       | Value.Array vs -> Array (Array.mapi (fun i v -> residualizeValue (Elem (base, Const i)) v) vs)
@@ -386,6 +415,35 @@ module Stmt =
          else eval (eval state b) w                 
       | Do (b, c) as w -> eval state (Seq (b, While (c, b)))      
     
+    let rec eval' stmt =
+      let open Value in
+      match stmt with
+      | Assn (x, e) ->
+         let se = Expr.eval' e in
+         fun state -> State.set state x (se state)
+      | Seq (l, r) ->
+         let sr = eval' r in
+         let sl = eval' l in
+         fun state -> sr (sl state) 
+      | Skip -> fun state -> state
+      | If (c, t, e) ->
+         let sc = Expr.eval' c in
+         let st = eval' t      in
+         let se = eval' e      in
+         fun state -> (if !?(sc state) <> 0 then st else se) state
+      | While (c, b) as w ->
+         let sc   = Expr.eval' c             in
+         let sb   = eval' b                  in
+         let knot = Stdlib.ref (fun state -> state) in
+         knot := (fun state ->
+                    if !?(sc state) = 0
+                    then state
+                    else !knot (sb state));
+         !knot
+      | Do (b, c) as w ->
+         let ss = eval' (Seq (b, While (c, b))) in
+         fun state -> ss state      
+    
     let residualizeAfter state stmt =
       State.residualize
         (function
@@ -472,6 +530,32 @@ module Stmt =
      
   end
 
+module GE_exp =
+  struct
+
+    
+    let make k =
+      let open Expr in
+      let open Stmt in
+      let rec inner acc k =
+         if k > 0
+         then
+           inner 
+             (acc @
+             (if k mod 2 == 1
+                then [Assn ("d", Binop ("*", Var "d", Var "n"))]
+                else []
+             ) @
+             [Assn ("n", Binop ("*", Var "n", Var "n"))]) (k/2)
+         else acc
+      in
+      List.fold_right (fun e acc -> Seq (e, acc)) (inner [Assn ("d", Const 1)] k) Skip
+
+
+    let _ = Printf.printf "%s" (Formeat.to_string (Stmt.pretty (make 5)))
+  end
+
+  
 module Parser =
   struct
 
@@ -609,7 +693,7 @@ let _ =
     (match Parser.parse @@ Util.read (Setup.getFile ()) with
      | `Ok stmt ->
         (match Setup.getMode () with
-         | `Run  -> Printf.printf "%s\n" @@ show (State.Printable.t) (State.toPrintable @@ Stmt.eval (Setup.getInput ()) stmt)
+         | `Run  -> Printf.printf "%s\n" @@ show (State.Printable.t) (State.toPrintable @@ Stmt.eval' stmt (Setup.getInput ()))
          | `Spec -> 
             let (stmt', state') = Stmt.spec (Setup.getInput ()) stmt in
             let stmt'' = Stmt.residualizeAfter state' stmt' in
