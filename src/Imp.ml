@@ -48,8 +48,7 @@ module Value =
     | Dyn      -> true
     | Int   _  -> false
     | Sexp (_, vs) | Array vs -> Array.exists dyn vs
-    
-       
+           
     let rec join v1 v2 =
       match v1, v2 with
       | Int x , Int y when x = y ->
@@ -111,6 +110,15 @@ module State =
     module M = Map.Make (String)
       
     type t = Value.t M.t
+
+    let equals st1 st2 =
+      let bs1 = M.bindings st1 in
+      let bs2 = M.bindings st2 in
+      (List.length bs1 = List.length bs2) &&
+      (List.for_all
+         (fun x -> x)  
+         (List.map (fun (x, y) -> 0 = Stdlib.compare x y) (List.combine bs1 bs2))
+      )
     
     let toPrintable s = List.map (fun (name, v) -> name, Value.toPrintable v)(M.bindings s)
   
@@ -350,8 +358,8 @@ module Expr =
        let (xv', x'), (yv', y') = spec state x, spec state y in
        (match xv', yv' with
         | Value.Int xv, Value.Int yv ->
-           let v = evalBinop xv' yv' op) in
-           (v, Const !? v) 
+           let v = evalBinop xv' yv' op in
+           (v, Const (Value.(!?) v)) 
         | _, _ -> (Value.Dyn, Binop (op, x', y'))
        )
 
@@ -359,17 +367,33 @@ module Expr =
        let esv, ese = Array.split @@ Array.map (spec state) es in     
        Value.Array esv, Array ese
     
-    | Sexp (t, es) -> Sexp (t, Array.map (spec state) es)
+    | Sexp (t, es) ->
+       let esv, ese = Array.split @@ Array.map (spec state) es in
+       Value.Sexp (t, esv), Sexp (t, ese)
     | Length e ->
-       (match spec state e with
-        | Array es | Sexp (_, es) -> Const (Array.length es)       
-        | e'       -> Length e'        
+       let ev, ee = spec state e in
+       (match ev with
+        | Value.Array es | Value.Sexp (_, es) ->
+           let len = Array.length es in
+           Value.Int len, Const len        
+        | _ -> Value.Dyn, Length ee        
        )
     | Elem (a, i) ->
-       (match spec state a, spec state i with
-        | Array es, Const i -> es.(i)
-        | a', i'            -> Elem (a', i')
-       )
+       let av, ae = spec state a in
+       let iv, ie = spec state i in
+       let rv =
+         match av, iv with
+         | (Value.Sexp (_, es) | Value.Array es), Value.Int i ->
+            es.(i)
+         | _ -> Value.Dyn
+       in
+       let re =
+         match ae, ie with
+         | (Sexp (_, es) | Array es), Const i-> es.(i)
+         | _ -> Elem (ae, ie)
+       in
+       (rv, re)
+    (*
     | Subst (a, ivs) ->
        (match spec state a, List.map (fun (i, v) -> spec state i, spec state v) ivs with
         | Array a', ivs' ->
@@ -395,7 +419,7 @@ module Expr =
            )
         | a', ivs' -> Subst (a', ivs')
        )
-    
+     *)
   end
 
 module Stmt =
@@ -498,42 +522,13 @@ module Stmt =
       match residualizeAfter state Skip with
       | Skip -> stmt
       | s    -> Seq (s, stmt)
-    
+
     let rec spec state =
       function
       | Skip        -> (Skip, state)
       | Assn (x, e) ->
          let v, e' = Expr.spec state e in
-         Assn (x, e'), State.set state x v
-    
-         (match e' with
-          | Expr.Const ve -> (Skip, State.set state x (Value.int ve))
-          | Expr.Array es ->
-             let rec toValue base es =
-               let _, subst, values =
-                 Array.fold_left
-                   (fun (i, subst, values) ->
-                      function
-                      | Expr.Const n  -> (i+1, (Expr.Const i, Expr.Const n)::subst, (Value.Int n)::values)
-                      | Expr.Array es ->
-                         let base', values' =
-                           toValue (Expr.Elem (base, Expr.Const i)) es
-                         in
-                         (i+1, (Expr.Const i, base')::subst, (Value.Array (Array.of_list values')) :: values)
-                      | b -> (i+1, (Expr.Const i, b)::subst, Value.Dyn::values)
-                   ) (0, [], []) es
-               in
-               match subst with
-               | [] -> base, List.rev values
-               | _  -> Expr.Subst (base, List.rev subst), List.rev values
-             in
-             let x', es' = toValue (Var x) es in
-             let v       = Value.Array (Array.of_list es') in
-             if Value.dyn v
-             then (Assn (x, x'), State.set state x v)
-             else (Skip        , State.set state x v)
-          | _ -> (Assn (x, e'), State.unset state x)
-         )  
+         (if Value.dyn v then Assn (x, e') else Skip), State.set state x v
       | Seq (s1, s2) ->
          (match spec state s1 with
           | (Skip, state') -> spec state' s2
@@ -544,33 +539,42 @@ module Stmt =
              )
          ) 
       | If (c, t, e) ->
-         (match Expr.spec state c with
-          | Expr.Const cv when cv != 0 -> spec state t
-          | Expr.Const _               -> spec state e
-          | c' ->
+         let cv, ce = Expr.spec state c in
+         (match cv with
+          | Value.Int v when v != 0 -> spec state t
+          | Value.Int _             -> spec state e
+          | _ ->
              let t', state'  = spec state t in
              let e', state'' = spec state e in
              let joined      = State.join state' state'' in
-             If (c', residualizeAfter (State.diff state'  joined) t',
+             If (ce, residualizeAfter (State.diff state'  joined) t',
                      residualizeAfter (State.diff state'' joined) e'),
              joined
          ) 
       | While (c, s) as w ->
-         (match Expr.spec state c with
-          | Expr.Const cv when cv != 0 -> spec state (Seq (s, w)) 
-          | Expr.Const cv              -> (Skip, state)
+         let cv, ce = Expr.spec state c in
+         (match cv with
+          | Value.Int v when v != 0 -> spec state (Seq (s, w)) 
+          | Value.Int _             -> (Skip, state)
           | _ ->
-             let _ , state'   = spec state s                     in
-             let _ , state''  = spec (State.join state state') s in
-             let state''      = State.join state state''         in
-             let s', state''' = spec state'' s                   in
+             let state'     = fix s state        in
+             let _, ce      = Expr.spec state' c in
+             let s', state' = spec state' s      in
              residualizeBefore
-               (State.diff state state'')
-               (While (Expr.spec state'' c, residualizeAfter (State.diff state''' state'') s')),
-             state''
+               (State.diff state state')
+               (While (ce, s')),
+             state'
          ) 
       | Do (s, c) -> spec state (Seq (s, While (c, s)))
-     
+    and fix stmt state =
+      let rec inner state =
+        let state' = State.join state (snd @@ spec state stmt) in
+        if State.equals state' state
+        then state
+        else inner state'
+      in
+      inner state
+    
   end
 
 module GE_exp =
